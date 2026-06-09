@@ -1,0 +1,20 @@
+# 实验01：医学特征线性映射层验证
+## 1. 实验目标
+通过 $Y = XW^T + b$ 线性映射，实现4维原始医学特征投影到2维临床诊断空间（肺炎/健康），验证batch_size=3并行处理能力，为BioMedLM分类头铺垫。
+## 2. 运行环境
+硬件：RTX 4050
+框架：PyTorch
+## 3. 完整可运行代码
+```python
+# code/linear_demo/linear.py
+import torch
+import torch.nn as nn
+
+in_features = 4    # 4维原始医学指标
+out_features = 2   # 2维诊断：肺炎、健康
+linear_layer = nn.Linear(in_features, out_features)
+
+# Batch=3：3位病人样本
+x = torch.randn(3, in_features)
+y = linear_layer(x)
+print(f"输出张量形状: {y.shape}") # 输出 torch.Size([3, 2])
