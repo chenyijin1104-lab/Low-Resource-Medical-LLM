@@ -6,6 +6,7 @@ import numpy as np
 from PIL import Image
 from transformers import BertConfig, BertModel, BertTokenizer
 import networkx as nx
+import torchvision.models as models # 【新增】：引入视觉顶尖模型库
 
 # 禁用 tokenizers 的并行警告
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -20,97 +21,51 @@ DISEASE_MAP = {
 REVERSE_DISEASE_MAP = {v: k for k, v in DISEASE_MAP.items()}
 
 # ==========================================
-# 1. 理智轨道：中医知识图谱推理引擎 (GraphRAG) - 肺系病深度扩展版
+# 1. 理智轨道：中医知识图谱推理引擎 (GraphRAG) - 数据解耦版
 # ==========================================
 class MedicalGraphEngine:
-    def __init__(self):
+    def __init__(self, json_path="data/kg_data/tcm_knowledge.json"):
         self.G = nx.DiGraph()
+        self.json_path = json_path
         self._build_sino_western_knowledge_graph()
 
     def _build_sino_western_knowledge_graph(self):
         """
-        在内存中编织一张【极深厚】的中西医结合肺系病知识星网
+        从底层 JSON 数据库动态渲染中西医结合星网
         """
-        # A. 导入西医疾病节点
-        self.G.add_nodes_from(["正常", "肺炎", "气胸", "支气管炎", "肺结核", "支气管哮喘", "肺气肿"], type="WesternDisease")
-        
-        # B. 导入中医证型节点
-        self.G.add_nodes_from([
-            "太阳中风证", "痰热壅肺证", "肺络受损证", 
-            "风寒袭肺证", "肺阴亏耗证", "寒饮伏肺证", "痰浊壅肺证"
-        ], type="TCMSyndrome")
-        
-        # C. 导入临床体征/症状节点 (极大扩充)
-        self.G.add_nodes_from([
-            "发热", "恶风", "汗出", "脉缓",                  # 太阳中风
-            "高热", "咳嗽", "咳吐黄脓痰", "双肺听诊湿啰音",     # 痰热壅肺(肺炎)
-            "瘦高体型", "突发单侧胸部剧痛", "呼吸困难", "叩诊鼓音", # 肺络受损(气胸)
-            "咳嗽声重", "气急", "咽痒", "咳痰稀白", "鼻塞流清涕",  # 风寒袭肺(支气管炎)
-            "干咳", "咳血", "潮热", "盗汗", "消瘦",           # 肺阴亏耗(肺结核)
-            "喘息哮鸣", "胸膈满闷", "形寒怕冷", "不能平卧",      # 寒饮伏肺(哮喘)
-            "咳逆喘满", "胸部膨满", "咳痰白黏", "动则喘甚"       # 痰浊壅肺(慢阻肺/肺气肿)
-        ], type="Symptom")
-        
-        # D. 导入经方方剂节点
-        self.G.add_nodes_from([
-            "桂枝汤", "麻杏石甘汤", "百合固金汤加减", 
-            "三拗汤", "月华丸", "小青龙汤", "苏子降气汤"
-        ], type="Formula")
-        
-        # E. 导入底层中药材节点
-        self.G.add_nodes_from([
-            "桂枝", "白芍", "炙甘草", "生姜", "大枣",         
-            "麻黄", "苦杏仁", "石膏",                        
-            "百合", "生地黄", "熟地黄", "麦冬", "玄参", "贝母",
-            "天冬", "山药", "百部", "沙参", "阿胶",          
-            "干姜", "细辛", "五味子", "半夏",               
-            "紫苏子", "前胡", "厚朴", "肉桂", "当归"         
-        ], type="Herb")
-
-        # =========================================================
-        # 编织逻辑连线
-        # =========================================================
-        # 1. 跨界映射 (WesternDisease -> TCMSyndrome)
-        self.G.add_edges_from([
-            ("肺炎", "痰热壅肺证"), ("气胸", "肺络受损证"),
-            ("支气管炎", "风寒袭肺证"), ("肺结核", "肺阴亏耗证"),
-            ("支气管哮喘", "寒饮伏肺证"), ("肺气肿", "痰浊壅肺证")
-        ], relation="mapped_to_syndrome")
-
-        # 2. 中医辨证 (TCMSyndrome -> Symptom)
-        self.G.add_edges_from([
-            ("太阳中风证", "发热"), ("太阳中风证", "恶风"), ("太阳中风证", "汗出"), ("太阳中风证", "脉缓"),
-            ("痰热壅肺证", "高热"), ("痰热壅肺证", "咳嗽"), ("痰热壅肺证", "咳吐黄脓痰"), ("痰热壅肺证", "双肺听诊湿啰音"),
-            ("肺络受损证", "瘦高体型"), ("肺络受损证", "突发单侧胸部剧痛"), ("肺络受损证", "呼吸困难"), ("肺络受损证", "叩诊鼓音"),
-            ("风寒袭肺证", "咳嗽声重"), ("风寒袭肺证", "气急"), ("风寒袭肺证", "咽痒"), ("风寒袭肺证", "咳痰稀白"), ("风寒袭肺证", "鼻塞流清涕"),
-            ("肺阴亏耗证", "干咳"), ("肺阴亏耗证", "咳血"), ("肺阴亏耗证", "潮热"), ("肺阴亏耗证", "盗汗"), ("肺阴亏耗证", "消瘦"),
-            ("寒饮伏肺证", "喘息哮鸣"), ("寒饮伏肺证", "胸膈满闷"), ("寒饮伏肺证", "形寒怕冷"), ("寒饮伏肺证", "不能平卧"),
-            ("痰浊壅肺证", "咳逆喘满"), ("痰浊壅肺证", "胸部膨满"), ("痰浊壅肺证", "咳痰白黏"), ("痰浊壅肺证", "动则喘甚")
-        ], relation="has_symptom")
-
-        # 3. 确立治法 (TCMSyndrome -> Formula)
-        self.G.add_edges_from([
-            ("太阳中风证", "桂枝汤"), ("痰热壅肺证", "麻杏石甘汤"), ("肺络受损证", "百合固金汤加减"),
-            ("风寒袭肺证", "三拗汤"), ("肺阴亏耗证", "月华丸"), ("寒饮伏肺证", "小青龙汤"), ("痰浊壅肺证", "苏子降气汤")
-        ], relation="treats_with")
-
-        # 4. 药方配伍 (Formula -> Herb)
-        self.G.add_edges_from([
-            ("桂枝汤", "桂枝"), ("桂枝汤", "白芍"), ("桂枝汤", "炙甘草"), ("桂枝汤", "生姜"), ("桂枝汤", "大枣"),
-            ("麻杏石甘汤", "麻黄"), ("麻杏石甘汤", "苦杏仁"), ("麻杏石甘汤", "石膏"), ("麻杏石甘汤", "炙甘草"),
-            ("百合固金汤加减", "百合"), ("百合固金汤加减", "生地黄"), ("百合固金汤加减", "熟地黄"), ("百合固金汤加减", "贝母"),
-            ("三拗汤", "麻黄"), ("三拗汤", "苦杏仁"), ("三拗汤", "炙甘草"),
-            ("月华丸", "天冬"), ("月华丸", "麦冬"), ("月华丸", "生地黄"), ("月华丸", "熟地黄"), ("月华丸", "山药"), ("月华丸", "百部"), ("月华丸", "沙参"), ("月华丸", "贝母"), ("月华丸", "阿胶"),
-            ("小青龙汤", "麻黄"), ("小青龙汤", "桂枝"), ("小青龙汤", "干姜"), ("小青龙汤", "细辛"), ("小青龙汤", "五味子"), ("小青龙汤", "白芍"), ("小青龙汤", "半夏"), ("小青龙汤", "炙甘草"),
-            ("苏子降气汤", "紫苏子"), ("苏子降气汤", "半夏"), ("苏子降气汤", "前胡"), ("苏子降气汤", "厚朴"), ("苏子降气汤", "肉桂"), ("苏子降气汤", "当归"), ("苏子降气汤", "炙甘草")
-        ], relation="contains_herb")
+        import json
+        if not os.path.exists(self.json_path):
+            print(f"❌ 严重错误：未找到底层数据库 {self.json_path}")
+            return
+            
+        with open(self.json_path, 'r', encoding='utf-8') as f:
+            knowledge_base = json.load(f)
+            
+        for item in knowledge_base["syndromes"]:
+            syndrome = item["name"]
+            western_disease = item["western_disease"]
+            symptoms = item["symptoms"]
+            formula = item["formula"]
+            herbs = item["herbs"]
+            
+            # 构建跨界桥梁
+            self.G.add_node(syndrome, type="TCMSyndrome")
+            self.G.add_node(western_disease, type="WesternDisease")
+            self.G.add_edge(western_disease, syndrome, relation="mapped_to_syndrome")
+            
+            # 构建症状、方剂、药材拓扑图
+            for sym in symptoms:
+                self.G.add_node(sym, type="Symptom")
+                self.G.add_edge(syndrome, sym, relation="has_symptom")
+            self.G.add_node(formula, type="Formula")
+            self.G.add_edge(syndrome, formula, relation="treats_with")
+            for herb in herbs:
+                self.G.add_node(herb, type="Herb")
+                self.G.add_edge(formula, herb, relation="contains_herb")
 
     def graph_reasoning(self, text_content):
         # 关键词命中检测
-        hit_symptoms = []
-        for node, data in self.G.nodes(data=True):
-            if data.get('type') == 'Symptom' and node in text_content:
-                hit_symptoms.append(node)
+        hit_symptoms = [node for node, data in self.G.nodes(data=True) if data.get('type') == 'Symptom' and node in text_content]
                 
         if not hit_symptoms:
             return None, None, "❌ 图谱未在主诉中抽离出核心中医体征"
@@ -121,7 +76,7 @@ class MedicalGraphEngine:
             if data.get('type') == 'TCMSyndrome':
                 expected_symptoms = [tgt for _, tgt, rel in self.G.out_edges(node, data='relation') if rel == 'has_symptom']
                 score = sum(1 for sym in hit_symptoms if sym in expected_symptoms)
-                if score > 0:
+                if score > 0: # 命中至少一个症状即纳入疑似
                     matched_syndromes.append((node, score))
                     
         if not matched_syndromes:
@@ -150,17 +105,24 @@ class MedicalGraphEngine:
         return target_western_disease, report
 
 # ==========================================
-# 2. 直觉轨道：多模态视觉底座
+# 2. 直觉轨道：多模态视觉底座 (v4.0 ResNet 升级版)
 # ==========================================
 class MedicalMultimodalModel(nn.Module):
     def __init__(self, num_classes=10):
         super().__init__()
-        self.cnn = nn.Sequential(
-            nn.Conv2d(1, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2, 2),
-            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2, 2),
-            nn.AdaptiveAvgPool2d((16, 16)) 
-        )
-        self.img_proj = nn.Linear(64, 256) 
+        
+        # 【微创手术 1】：引入预训练的 ResNet-50，截断全局池化和全连接层
+        resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+        self.cnn = nn.Sequential(*list(resnet.children())[:-2])
+        
+        # 【微创手术 2】：硬件防爆机制，冻结前 80% 的网络，只放开最深层的特征捕捉能力
+        for param in self.cnn[:-1].parameters():
+            param.requires_grad = False
+            
+        # 【微创手术 3】：特征降维打击 (ResNet 2048维 -> 多模态 256维)
+        self.img_proj = nn.Linear(2048, 256) 
+        
+        # 文本底座保持完全一致
         self.bert = BertModel(BertConfig(vocab_size=21128, hidden_size=256, num_hidden_layers=4, num_attention_heads=4, intermediate_size=1024))
         self.cross_attn = nn.MultiheadAttention(embed_dim=256, num_heads=4, batch_first=True, dropout=0.3)
         self.classifier = nn.Sequential(
@@ -168,10 +130,20 @@ class MedicalMultimodalModel(nn.Module):
         )
         
     def forward(self, images, input_ids, attention_mask):
+        # 动态通道拓展：将单通道灰度图复制为 3 通道以适配 ResNet
+        if images.size(1) == 1:
+            images = images.repeat(1, 3, 1, 1)
+            
+        # 输入 256x256 -> 经过 ResNet 变成 (Batch, 2048, 8, 8)
         img_f = self.cnn(images) 
-        img_seq = F.relu(self.img_proj(img_f.view(img_f.size(0), 64, -1).permute(0, 2, 1))) 
+        
+        # 展平空间维度，转换为 Cross-Attention 识别的序列 (Batch, Sequence=64, Dim=2048)
+        img_seq = img_f.view(img_f.size(0), 2048, -1).permute(0, 2, 1) 
+        img_seq = F.relu(self.img_proj(img_seq)) # 降维至 (Batch, 64, 256)
+        
         bert_out = self.bert(input_ids=input_ids, attention_mask=attention_mask)
         txt_pooler = bert_out.pooler_output 
+        
         attn_out, _ = self.cross_attn(query=txt_pooler.unsqueeze(1), key=img_seq, value=img_seq)
         fused_features = torch.cat((attn_out.squeeze(1), txt_pooler), dim=1)
         return self.classifier(fused_features)
@@ -182,7 +154,7 @@ class MedicalMultimodalModel(nn.Module):
 def dual_track_diagnosis(text_content, xray_path, model_path="./checkpoints/real_medical_model_sota.pth", rag_boost_weight=20.0):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("\n" + "="*70)
-    print("🏥 【中西医双轨制医疗大脑 v3.0 - 全域肺系病知识网络】联合会诊启动")
+    print("🏥 【中西医双轨制医疗大脑 v4.0 - ResNet全域网络】联合会诊启动")
     print("="*70)
     print(f"📄 病患主诉: {text_content}")
     print("-" * 70)
@@ -246,11 +218,6 @@ def dual_track_diagnosis(text_content, xray_path, model_path="./checkpoints/real
     print("=" * 70)
 
 if __name__ == "__main__":
-    # ⚠️ 极其苛刻的新测试用例：
-    # 患者给的是肺结核的阴虚体征，但由于模型没见过这图，视觉依然可能会乱猜。
     test_text = "患者近期消瘦明显，伴有干咳、夜间盗汗，下午有潮热现象，请求专家会诊。"
-    
-    # 真实测试影像 (依然沿用你文件夹里的病毒性肺炎，作为干扰项)
     test_image_path = "./data/chest_xray/train/PNEUMONIA/person80_virus_150.jpeg" 
-    
     dual_track_diagnosis(text_content=test_text, xray_path=test_image_path)

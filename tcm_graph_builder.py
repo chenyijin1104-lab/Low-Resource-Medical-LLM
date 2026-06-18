@@ -1,39 +1,48 @@
 import networkx as nx
+import json
+import os
 
-def build_tcm_graph():
-    print("🕸️ 正在内存中构建《伤寒杂病论》知识图谱...")
+def build_tcm_graph(json_path="data/kg_data/tcm_knowledge.json"):
+    print(f"🕸️ 正在从底层数据库 {json_path} 加载并动态构建专家知识图谱...")
     G = nx.DiGraph() # 初始化一个有向图
 
-    # ==========================================
-    # 1. 导入实体节点 (Nodes)
-    # ==========================================
-    # 证型
-    G.add_node("太阳中风", type="Syndrome")
-    # 症状
-    G.add_nodes_from(["发热", "恶风", "汗出", "脉缓", "剧烈胸痛", "呼吸困难"], type="Symptom")
-    # 方剂
-    G.add_node("桂枝汤", type="Formula")
-    # 中药
-    G.add_nodes_from(["桂枝", "白芍", "炙甘草", "生姜", "大枣"], type="Herb")
+    # 确保文件存在
+    if not os.path.exists(json_path):
+        print(f"❌ 找不到数据文件：{json_path}，请检查路径！")
+        return G
 
     # ==========================================
-    # 2. 导入逻辑连线 (Edges / Relationships)
+    # 1. 打开并读取 JSON 知识库 (数据与逻辑剥离)
     # ==========================================
-    # 证型 -> 症状 (has_symptom)
-    G.add_edges_from([
-        ("太阳中风", "发热"), ("太阳中风", "恶风"), 
-        ("太阳中风", "汗出"), ("太阳中风", "脉缓")
-    ], relation="has_symptom")
+    with open(json_path, 'r', encoding='utf-8') as f:
+        knowledge_base = json.load(f)
 
-    # 证型 -> 方剂 (treats_with)
-    G.add_edge("太阳中风", "桂枝汤", relation="treats_with")
+    # ==========================================
+    # 2. 动态遍历字典，自动渲染图谱节点和边
+    # ==========================================
+    for item in knowledge_base["syndromes"]:
+        syndrome = item["name"]
+        symptoms = item["symptoms"]
+        formula = item["formula"]
+        herbs = item["herbs"]
 
-    # 方剂 -> 中药 (contains_herb)
-    G.add_edges_from([
-        ("桂枝汤", "桂枝"), ("桂枝汤", "白芍"), 
-        ("桂枝汤", "炙甘草"), ("桂枝汤", "生姜"), ("桂枝汤", "大枣")
-    ], relation="contains_herb")
-    
+        # 添加【证型】节点
+        G.add_node(syndrome, type="Syndrome")
+        
+        # 添加【症状】节点及连线 (has_symptom)
+        for sym in symptoms:
+            G.add_node(sym, type="Symptom")
+            G.add_edge(syndrome, sym, relation="has_symptom")
+        
+        # 添加【方剂】节点及连线 (treats_with)
+        G.add_node(formula, type="Formula")
+        G.add_edge(syndrome, formula, relation="treats_with")
+        
+        # 添加【中药】节点及连线 (contains_herb)
+        for herb in herbs:
+            G.add_node(herb, type="Herb")
+            G.add_edge(formula, herb, relation="contains_herb")
+            
     print(f"✅ 图谱构建完成！当前图谱包含 {G.number_of_nodes()} 个中医实体节点，{G.number_of_edges()} 条逻辑边。")
     return G
 
@@ -79,6 +88,6 @@ if __name__ == "__main__":
     # 实例化图谱
     tcm_graph = build_tcm_graph()
     
-    # 模拟一次临床问诊
-    patient_symptoms = ["发热", "恶风", "汗出"]
+    # 模拟一次临床问诊（已替换为测试“痰热郁肺”的特异性症状）
+    patient_symptoms = ["喘咳气涌", "胸闷", "痰多色黄黏稠"]
     multi_hop_reasoning(tcm_graph, patient_symptoms)
