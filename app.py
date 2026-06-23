@@ -4,19 +4,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from PIL import Image
-import cv2 # 用于生成热力图
+import cv2 
 from transformers import BertConfig, BertModel, BertTokenizer
 import torchvision.models as models
 import torchvision.transforms as transforms
 import gradio as gr
 import json
+import requests
 
 # ================= 新增 RAG 依赖 =================
 import chromadb
 from sentence_transformers import SentenceTransformer
-# =================================================
 
-# 禁用 tokenizer 并行警告
+# ================= 新增 V8.0 LangGraph 多智能体依赖 =================
+from typing import Dict, TypedDict
+from langgraph.graph import StateGraph, START, END
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # ==========================================
@@ -31,7 +34,7 @@ REVERSE_DISEASE_MAP = {v.split(" ")[0]: k for k, v in DISEASE_MAP.items()}
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ==========================================
-# 1. 后端装载：千万级 RAG 向量检索引擎 (全新升级投票制)
+# 1. 后端装载：千万级 RAG 向量检索引擎 
 # ==========================================
 class MedicalRAGEngine:
     def __init__(self, db_path="data/vector_db", model_name="BAAI/bge-small-zh-v1.5"):
@@ -52,15 +55,11 @@ class MedicalRAGEngine:
         if not patient_text or len(patient_text.strip()) == 0:
             return None, "无文本输入，跳过 RAG 仲裁。"
 
-        # 1. 瞬间将患者主诉化为高维向量
         query_vector = self.embed_model.encode([patient_text]).tolist()
-        
-        # 2. 在 33 万条古籍中极速检索 Top 3
         results = self.collection.query(query_embeddings=query_vector, n_results=3)
 
         evidence_chain = "### 🧠 千万级 RAG 古籍循证链条已触发\n"
         
-        # 3. 工业级扩展：古今病机映射字典（扩充高频及近代医学词汇防止漏判）
         keyword_disease_mapping = {
             "痨": "肺结核", "盗汗": "肺结核", "咳血": "肺结核", "骨蒸": "肺结核", "结核": "肺结核",
             "喘": "支气管炎", "哮": "支气管炎", "风寒": "支气管炎", "气管": "支气管炎",
@@ -71,28 +70,22 @@ class MedicalRAGEngine:
         }
 
         detected_disease = None
-        disease_scores = {} # 疾病积分投票池
+        disease_scores = {}
 
-        # 4. 构建前端展示报告，并执行多维权重累加投票
         for i in range(3):
             text = results['documents'][0][i]
             book = results['metadatas'][0][i]['book']
             distance = results['distances'][0][i]
 
-            # 截取前150个字展示，防止前端屏幕塞爆
             display_text = text[:150] + "..." if len(text) > 150 else text
             evidence_chain += f"🔹 **文献 [{i+1}] (来源: 《{book}》)** | 语义距离: `{distance:.4f}`\n> {display_text}\n\n"
 
-            # 寻靶逻辑升级：多轮积分制博弈
             if distance < 0.5: 
                 for kw, target_dis in keyword_disease_mapping.items():
                     if kw in text:
-                        # 核心算法：语义距离越小(0.5-distance越大)、排名越靠前(3-i越大)，其所代表的特征词投票权重越高
                         score = (0.5 - distance) * (3 - i)
-                        # 将当前关键词算出的置信度得分，累加进该西医病种的总分池中
                         disease_scores[target_dis] = disease_scores.get(target_dis, 0) + score
         
-        # 总结仲裁意见：选出当前总积分池里得分最高的病种作为最终靶向
         if disease_scores:
             detected_disease = max(disease_scores, key=disease_scores.get)
             evidence_chain += f"\n⚖️ **RAG 语义推断**：通过多文献特征加权积分投票，最终聚焦指涉现代西医学之 **【{detected_disease}】**，触发动态特征融合机制！"
@@ -102,7 +95,7 @@ class MedicalRAGEngine:
         return detected_disease, evidence_chain
 
 # ==========================================
-# 2. 后端装载：v5.0 终极多模态网络 (含 XAI 钩子) [原封不动]
+# 2. 后端装载：v5.0 多模态网络
 # ==========================================
 class MedicalMultimodalModel(nn.Module):
     def __init__(self, num_classes=10):
@@ -143,9 +136,7 @@ class MedicalMultimodalModel(nn.Module):
             return logits, img_seq.mean(dim=1), txt_pooler
         return logits
 
-# 初始化全局变量
 print("🔄 正在装载底层模型权重与RAG库...")
-# --- 引擎切换：加载 RAG 引擎替代原本的 Graph 引擎 ---
 rag_engine = MedicalRAGEngine()
 tokenizer = BertTokenizer.from_pretrained('hfl/chinese-macbert-base')
 model = MedicalMultimodalModel(num_classes=10).to(device)
@@ -159,13 +150,12 @@ else:
     print("⚠️ 未检测到训练好的权重文件，将使用随机初始化参数进行演示。")
 
 # ==========================================
-# 3. 核心大模型会诊逻辑 (包含热力图生成)
+# 3. 核心诊断与状态封装 (Phase 1)
 # ==========================================
 def run_diagnosis(image, text, boost_weight):
     if image is None or not text.strip():
-        return None, "⚠️ 请同时上传 X 光片并输入患者主诉！", None, None, "无法诊断：数据不全"
+        return None, "⚠️ 请同时上传 X 光片并输入患者主诉！", None, None, "无法诊断：数据不全", {}
 
-    # --- 核心接口调用切换：调用 RAG 引擎的仲裁逻辑 ---
     target_western_disease, rag_report = rag_engine.rag_arbitration(text)
     
     transform = transforms.Compose([
@@ -201,14 +191,11 @@ def run_diagnosis(image, text, boost_weight):
         
     cam = np.maximum(cam, 0) 
     cam = cv2.resize(cam, (image.size[0], image.size[1])) 
-    
-    if np.max(cam) != 0:
-        cam = cam / np.max(cam)
+    if np.max(cam) != 0: cam = cam / np.max(cam)
         
     heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
     heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
     original_img_np = np.array(img_rgb)
-    
     cam_3d = np.expand_dims(cam, axis=2)
     superimposed_img = heatmap * cam_3d + original_img_np * (1 - cam_3d)
     heatmap_pil = Image.fromarray(np.uint8(superimposed_img))
@@ -217,70 +204,158 @@ def run_diagnosis(image, text, boost_weight):
     final_logits = logits.clone().detach()
     arbitration_msg = "✅ 未触发跨界干预，底层直觉逻辑闭环。"
     
-    # ==============================================================
-    # 【核心修改区】：结合 RAG 结果进行动态 Logit 注入 (自适应仲裁机制)
-    # ==============================================================
+    visual_conf = float(raw_probs[top_class])
     if target_western_disease in REVERSE_DISEASE_MAP:
         target_idx = REVERSE_DISEASE_MAP[target_western_disease]
-        
-        # 获取视觉模型对该 RAG 推断疾病的原始置信度
         visual_confidence = raw_probs[target_idx]
-        
-        # 动态自适应核心算法：
-        # 视觉网络越是不确定（概率越低），RAG 的介入权重就越大；
-        # 如果视觉网络已经比较确信，RAG 则提供温和的辅助证明，绝不“一票否决”。
         dynamic_boost = boost_weight * (1.0 - visual_confidence)
-        
-        # 温和注入 Logit
         final_logits[0, target_idx] += dynamic_boost
-        
-        arbitration_msg = f"⚖️ **动态自适应 RAG 仲裁生效！**\n系统综合评估了视觉网络的置信度。针对 RAG 靶向关联的【{target_western_disease}】，系统执行了平滑的 Logit 补偿加权 (Dynamic Boost: +{dynamic_boost:.2f})，实现了图文双轨特征的博弈与深度融合。"
-    # ==============================================================
+        arbitration_msg = f"⚖️ **动态自适应 RAG 仲裁生效！**\n系统综合评估了视觉网络的置信度。执行了平滑的 Logit 补偿加权 (Dynamic Boost: +{dynamic_boost:.2f})。"
         
     final_probs = F.softmax(final_logits, dim=1).flatten().cpu().detach().numpy()
     final_dict = {DISEASE_MAP[i]: float(final_probs[i]) for i in range(10)}
     top_class_final = np.argmax(final_probs)
     
-    conclusion = f"""
-### 🩺 双轨制最终会诊结论
-* 👁️ **盲目直觉 (仅神经网络)**: 疑似 **【{DISEASE_MAP[top_class]}】**
-* ⚖️ **仲裁状态**: {arbitration_msg}
-* 🏥 **循证确诊 (多模态+千万级 RAG 对齐)**: 综合确诊 **【{DISEASE_MAP[top_class_final]}】**
-    """
+    conclusion = f"""### 🩺 双轨制最终会诊结论\n* 👁️ **盲目直觉**: 疑似 **【{DISEASE_MAP[top_class]}】**\n* ⚖️ **仲裁状态**: {arbitration_msg}\n* 🏥 **循证确诊**: 综合确诊 **【{DISEASE_MAP[top_class_final]}】**"""
     
-    # 返回 RAG 报告替代原来的 graph_report
-    return heatmap_pil, rag_report, raw_dict, final_dict, conclusion
+    # 🎯 V8.0 核心：不再组装单一 Prompt，而是将全局状态打包成字典，准备喂给 LangGraph
+    state_payload = {
+        "patient_text": text,
+        "vision_info": f"置信度 {visual_conf*100:.1f}% 倾向【{DISEASE_MAP[top_class]}】",
+        "rag_info": rag_report if target_western_disease else "未检出特定重症",
+        "final_disease": DISEASE_MAP[top_class_final]
+    }
+    
+    return heatmap_pil, rag_report, raw_dict, final_dict, conclusion, state_payload
 
 # ==========================================
-# 4. Gradio 赛博朋克风 UI 界面构建
+# 4. V8.0 LangGraph 多智能体编排引擎 (Phase 2)
 # ==========================================
-theme = gr.themes.Soft(
-    primary_hue="blue",
-    secondary_hue="indigo",
-    neutral_hue="slate",
-    font=[gr.themes.GoogleFont('Inter'), 'ui-sans-serif', 'system-ui', 'sans-serif']
-)
 
-with gr.Blocks(theme=theme, title="Sino-Western Medical LLM") as demo:
+# 4.1 定义图状态 (State)
+class MedicalState(TypedDict):
+    patient_text: str
+    vision_info: str
+    rag_info: str
+    final_disease: str
+    western_opinion: str
+    tcm_opinion: str
+
+# 4.2 定义原生 API 调用模块 (Zero-bloat)
+def call_ollama_sync(prompt_text):
+    url = "http://localhost:11434/api/generate"
+    payload = {"model": "qwen2.5:3b", "prompt": prompt_text, "stream": False}
+    try:
+        response = requests.post(url, json=payload).json()
+        return response.get("response", "")
+    except Exception:
+        return "本地 Ollama 引擎未响应。"
+
+# 4.3 定义西医 Agent (Node A)
+def western_agent_node(state: MedicalState) -> Dict:
+    prompt = f"你是权威的西医呼吸科专家。患者主诉：【{state['patient_text']}】。底层AI视觉网络对X光片的推断为：【{state['vision_info']}】。请用极度专业的现代西医病理学术语，在80字以内给出纯西医视角的临床病理分析。不要有任何废话。"
+    opinion = call_ollama_sync(prompt)
+    return {"western_opinion": opinion}
+
+# 4.4 定义中医 Agent (Node B)
+def tcm_agent_node(state: MedicalState) -> Dict:
+    prompt = f"你是权威的中医温病学泰斗。患者主诉：【{state['patient_text']}】。我们从33万卷古籍中为你提取了相关医案证据：【{state['rag_info'][:300]}...】。请结合主诉与古籍，用专业的中医辨证术语（如阴阳气血、脏腑经络），在80字以内给出纯中医视角的病机推演。不要有任何废话。"
+    opinion = call_ollama_sync(prompt)
+    return {"tcm_opinion": opinion}
+
+# 4.5 编译 LangGraph 状态机
+workflow = StateGraph(MedicalState)
+workflow.add_node("Western_Agent", western_agent_node)
+workflow.add_node("TCM_Agent", tcm_agent_node)
+
+# 强制串行执行，榨干 RTX 4050 显存的同时防止 OOM
+workflow.add_edge(START, "Western_Agent")
+workflow.add_edge("Western_Agent", "TCM_Agent")
+workflow.add_edge("TCM_Agent", END)
+medical_graph = workflow.compile()
+
+# 4.6 最终图执行与主治医师(Chief Agent)流式输出
+def run_multi_agent_stream(state_payload):
+    if not state_payload:
+        yield "⚠️ 等待系统完成初始诊断..."
+        return
+        
+    initial_state = MedicalState(
+        patient_text=state_payload["patient_text"],
+        vision_info=state_payload["vision_info"],
+        rag_info=state_payload["rag_info"],
+        final_disease=state_payload["final_disease"],
+        western_opinion="",
+        tcm_opinion=""
+    )
+    
+    ui_output = "### 🌐 LangGraph 多智能体工作流启动\n\n"
+    yield ui_output + "*(正在调度【西医影像 Agent】分析病理...)*"
+    
+    # 执行 LangGraph，并捕获每个节点的增量状态更新UI
+    final_state = initial_state.copy()
+    for output in medical_graph.stream(initial_state):
+        for node_name, state_update in output.items():
+            final_state.update(state_update)
+            if node_name == "Western_Agent":
+                ui_output += f"**👨‍⚕️ 西医影像 Agent**：\n> {state_update['western_opinion']}\n\n"
+                yield ui_output + "*(正在调度【中医典籍 Agent】溯源古籍...)*"
+            elif node_name == "TCM_Agent":
+                ui_output += f"**🌿 中医典籍 Agent**：\n> {state_update['tcm_opinion']}\n\n"
+                yield ui_output + "*(⚖️ 状态图流转完毕！Chief Agent 正在执行联合裁决与流式报告生成...)*"
+
+    # 图执行完毕，唤醒 Chief Agent 进行打字机输出
+    chief_prompt = f"""你是本次会诊的主治医师（Chief Agent）。现在你需要融合团队给出的诊断。
+患者主诉：【{final_state['patient_text']}】
+底层多模态网络最终确诊：【{final_state['final_disease']}】
+西医专家的意见：【{final_state['western_opinion']}】
+中医专家的意见：【{final_state['tcm_opinion']}】
+
+请你起草一份200字左右的《V8.0 多智能体联合会诊最终报告》。要求逻辑自洽，中西医互证，并给出最终干预建议。直接输出报告正文，不要重复指令。"""
+
+    ui_output += "\n---\n### ✍️ 主治医师 (Chief Agent) 最终裁决报告\n"
+    
+    # 纯原生流式拉取
+    url = "http://localhost:11434/api/generate"
+    payload = {"model": "qwen2.5:3b", "prompt": chief_prompt, "stream": True}
+    
+    try:
+        response = requests.post(url, json=payload, stream=True)
+        for line in response.iter_lines():
+            if line:
+                chunk = json.loads(line)
+                ui_output += chunk.get("response", "")
+                yield ui_output 
+    except requests.exceptions.ConnectionError:
+        yield ui_output + "\n\n❌ 本地大模型服务未启动。"
+
+# ==========================================
+# 5. Gradio UI 界面构建
+# ==========================================
+theme = gr.themes.Soft(primary_hue="blue", secondary_hue="indigo", neutral_hue="slate")
+
+with gr.Blocks(theme=theme, title="V8.0 Multi-Agent Medical LLM") as demo:
     gr.Markdown(
         """
-        # 🏥 中西医双轨制多模态医疗大脑 (v5.0 终极版)
-        **Core Engine**: `ResNet-50` + `BERT` + `Cross-Attention` | **Vector DB**: `ChromaDB (33w+ Chunks)` | **XAI**: `Grad-CAM`
+        # 🏥 中西医双轨制多模态医疗大脑 (v8.0 Multi-Agent 架构版)
+        **Core**: `ResNet-50` + `ChromaDB` | **Orchestration**: `LangGraph` | **Agents**: `Qwen2.5 (Local)`
         
-        上传胸部 X 光片并输入患者临床主诉。系统不仅会执行多模态诊断和 Logit 仲裁，还会通过 **Grad-CAM 梯度追踪**实时生成热力图，并在 **33万条中医古籍** 中进行高维 RAG 检索，彻底打破深度学习黑盒！
+        系统已全面跃迁至**多智能体协作(Multi-Agent)**架构！在 LangGraph 有向无环图的精准调度下，【西医 Agent】与【中医 Agent】将首先进行独立推演，最后由【Chief Agent】进行跨模态流式仲裁。
         """
     )
+    
+    state_payload_hidden = gr.State({})
     
     with gr.Row():
         with gr.Column(scale=1):
             gr.Markdown("### 👨‍⚕️ 临床数据输入")
             input_image = gr.Image(type="pil", label="上传胸部 X 光影像", height=300)
-            input_text = gr.Textbox(lines=4, label="输入患者临床主诉 (文本)", placeholder="例如：患者近期消瘦明显，伴有干咳、夜间盗汗...")
-            boost_slider = gr.Slider(minimum=0.0, maximum=50.0, value=15.0, step=1.0, label="Logit RAG 干预权重", info="数值越大，古籍文献的纠偏干预能力越强")
-            submit_btn = gr.Button("🚀 启动联合会诊与 XAI 分析", variant="primary", size="lg")
+            input_text = gr.Textbox(lines=4, label="输入患者临床主诉 (文本)")
+            boost_slider = gr.Slider(minimum=0.0, maximum=50.0, value=15.0, step=1.0, label="Logit RAG 干预权重")
+            submit_btn = gr.Button("🚀 启动 LangGraph 多智能体联合会诊", variant="primary", size="lg")
             
             gr.Markdown("### 👁️ 可解释性 AI (XAI) 视觉追踪")
-            output_heatmap = gr.Image(type="pil", label="AI 视觉注意力热力图 (红色为高权重决策区)")
+            output_heatmap = gr.Image(type="pil", label="AI 视觉注意力热力图")
             
         with gr.Column(scale=1):
             gr.Markdown("### 📊 实时会诊监控大屏")
@@ -294,14 +369,21 @@ with gr.Blocks(theme=theme, title="Sino-Western Medical LLM") as demo:
                     gr.Markdown("#### ⚖️ RAG 仲裁后")
                     output_final_probs = gr.Label(num_top_classes=3, label="Logit 注入后的最终概率")
             output_conclusion = gr.Markdown("### 🩺 最终会诊结论\n(等待运行...)")
+            
+            gr.Markdown("---")
+            output_llm_report = gr.Markdown("### 🌐 LangGraph 多智能体工作流监控\n*(等待状态流转...)*")
 
     submit_btn.click(
         fn=run_diagnosis,
         inputs=[input_image, input_text, boost_slider],
-        outputs=[output_heatmap, output_graph_report, output_raw_probs, output_final_probs, output_conclusion]
+        outputs=[output_heatmap, output_graph_report, output_raw_probs, output_final_probs, output_conclusion, state_payload_hidden]
+    ).then(
+        fn=run_multi_agent_stream,
+        inputs=[state_payload_hidden],
+        outputs=[output_llm_report]
     )
 
-    gr.Markdown("--- \n*Developed by Chen Yijin | RTX 4050 Build | Powered by PyTorch, Gradio, ChromaDB & Grad-CAM*")
+    gr.Markdown("--- \n*Architected by Chen Yijin | Powered by PyTorch, LangGraph & Local Ollama*")
 
 if __name__ == "__main__":
     print("\n🌐 正在启动 Gradio 医疗控制面板...")
